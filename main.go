@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,14 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
-var db *sql.DB
+type App struct {
+	db          *sql.DB
+	oauthConfig *oauth2.Config
+}
 
 type Book struct {
 	ID     int    `json:"id"`
@@ -21,10 +27,19 @@ type Book struct {
 	Author string `json:"author"`
 }
 
+type User struct {
+	Sub     string `json:"sub"` // User ID
+	Name    string `json:"name"`
+	Email   string `json:"email"`
+	Picture string `json:"picture"` // URL of the user's profile picture
+}
+
 func main() {
 	// Load environment variables
 	godotenv.Load()
+	app := App{}
 	dbURL := os.Getenv("DB_URL")
+
 	if dbURL == "" {
 		log.Fatal("DB_URL environment variable is not set")
 	}
@@ -35,37 +50,36 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
-	// Check if the "books" table exists. If not, create it.
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS books (
-			id SERIAL PRIMARY KEY,
-			title TEXT NOT NULL,
-			author TEXT NOT NULL
-		)
-	`)
-	if err != nil {
-		log.Fatal(err)
+	app.db = db
+	app.oauthConfig = &oauth2.Config{
+		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		RedirectURL:  "http://localhost:8000/auth/google/login",
+		Scopes:       []string{"https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"},
+		Endpoint:     google.Endpoint,
 	}
 
 	// Create router
 	router := mux.NewRouter()
 
 	// Define routes.
-	router.HandleFunc("/books", getBooks).Methods("GET")
-	router.HandleFunc("/books/{id}", getBook).Methods("GET")
-	router.HandleFunc("/books", createBook).Methods("POST")
-	router.HandleFunc("/books/{id}", updateBook).Methods("PUT")
-	router.HandleFunc("/books/{id}", deleteBook).Methods("DELETE")
+	router.HandleFunc("/books", app.getBooks).Methods("GET")
+	router.HandleFunc("/books/{id}", app.getBook).Methods("GET")
+	router.HandleFunc("/books", app.createBook).Methods("POST")
+	router.HandleFunc("/books/{id}", app.updateBook).Methods("PUT")
+	router.HandleFunc("/books/{id}", app.deleteBook).Methods("DELETE")
+
+	// Handle Google OAuth login
+	router.HandleFunc("/auth/google/login", app.handleGoogleLogin).Methods("GET")
 
 	// Start the server
 	fmt.Println("Server listening on port 8000...")
 	log.Fatal(http.ListenAndServe(":8000", router))
 }
 
-func getBooks(w http.ResponseWriter, r *http.Request) {
+func (a *App) getBooks(w http.ResponseWriter, r *http.Request) {
 	// Get books from database
-	rows, err := db.Query("SELECT id, title, author FROM books")
+	rows, err := a.db.Query("SELECT id, title, author FROM books")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,14 +102,14 @@ func getBooks(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(books)
 }
 
-func getBook(w http.ResponseWriter, r *http.Request) {
+func (a *App) getBook(w http.ResponseWriter, r *http.Request) {
 	// Get ID from request
 	vars := mux.Vars(r)
 	id := vars["id"]
 
 	// Query the database to get the book with the specified ID
 	var book Book
-	err := db.QueryRow("SELECT id, title, author FROM books WHERE id = $1", id).Scan(&book.ID, &book.Title, &book.Author)
+	err := a.db.QueryRow("SELECT id, title, author FROM books WHERE id = $1", id).Scan(&book.ID, &book.Title, &book.Author)
 	if err != nil {
 		// http.Error(w, err.Error(), http.StatusInternalServerError)
 		http.NotFound(w, r)
@@ -113,7 +127,7 @@ func getBook(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(book)
 }
 
-func createBook(w http.ResponseWriter, r *http.Request) {
+func (a *App) createBook(w http.ResponseWriter, r *http.Request) {
 	// Parse request body to get the book data
 	var book Book
 	err := json.NewDecoder(r.Body).Decode(&book)
@@ -123,7 +137,7 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Insert new book to the database
-	_, err = db.Exec("INSERT INTO books (title, author) VALUES ($1, $2)", book.Title, book.Author)
+	_, err = a.db.Exec("INSERT INTO books (title, author) VALUES ($1, $2)", book.Title, book.Author)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -133,7 +147,7 @@ func createBook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
-func updateBook(w http.ResponseWriter, r *http.Request) {
+func (a *App) updateBook(w http.ResponseWriter, r *http.Request) {
 	// Get ID from request
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -161,7 +175,7 @@ func updateBook(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	// update book to the database
-	result, err := db.Exec("UPDATE books SET title = $1, author = $2 WHERE id = $3;", book.Title, book.Author, id)
+	result, err := a.db.Exec("UPDATE books SET title = $1, author = $2 WHERE id = $3;", book.Title, book.Author, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -184,7 +198,7 @@ func updateBook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func deleteBook(w http.ResponseWriter, r *http.Request) {
+func (a *App) deleteBook(w http.ResponseWriter, r *http.Request) {
 	// Get ID from request
 	vars := mux.Vars(r)
 	id := vars["id"]
@@ -204,7 +218,7 @@ func deleteBook(w http.ResponseWriter, r *http.Request) {
 	// }
 
 	// delete book to the database
-	result, err := db.Exec("DELETE FROM books WHERE id = $1", id)
+	result, err := a.db.Exec("DELETE FROM books WHERE id = $1", id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -225,4 +239,69 @@ func deleteBook(w http.ResponseWriter, r *http.Request) {
 
 	// Respond with success message
 	w.WriteHeader(http.StatusOK)
+}
+
+func (a *App) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	// Redirect user to Google's consent screen
+	url := a.oauthConfig.AuthCodeURL("state")
+	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+
+	// Retrieve authorization code from the query parameters
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing authorization code", http.StatusBadRequest)
+		return
+	}
+
+	// Exchange authorization code for access token
+	token, err := a.oauthConfig.Exchange(r.Context(), code)
+	if err != nil {
+		http.Error(w, "Failed to exchange token", http.StatusInternalServerError)
+		return
+	}
+
+	// Use token to access Google APIs or retrieve user information
+	client := a.oauthConfig.Client(context.Background(), token)
+	resp, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+	defer resp.Body.Close()
+
+	// Read the entire response body
+	// body, err := ioutil.ReadAll(resp.Body)
+	// if err != nil {
+	// 	http.Error(w, err.Error(), http.StatusInternalServerError)
+	// 	return
+	// }
+
+	// Convert the response body to a string and print it
+	// fmt.Println("Response Body:", string(body))
+
+	// Decode User response body
+	var userInfo User
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Check if user already exist in database
+	var count int
+	err = a.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1", userInfo.Email).Scan(&count)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if count == 0 {
+		// User doesn't exist, create a new account
+		_, err := a.db.Exec("INSERT INTO users (email, name, picture_url) VALUES ($1, $2, $3)", userInfo.Email, userInfo.Name, userInfo.Picture)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Display success message
+	w.Write([]byte("Authentication successful!"))
 }
