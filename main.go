@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -54,7 +57,7 @@ func main() {
 	app.oauthConfig = &oauth2.Config{
 		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
-		RedirectURL:  "http://localhost:8000/auth/google/login",
+		RedirectURL:  "http://localhost:8000/auth/google/callback",
 		Scopes:       []string{"https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"},
 		Endpoint:     google.Endpoint,
 	}
@@ -63,14 +66,16 @@ func main() {
 	router := mux.NewRouter()
 
 	// Define routes.
-	router.HandleFunc("/books", app.getBooks).Methods("GET")
-	router.HandleFunc("/books/{id}", app.getBook).Methods("GET")
-	router.HandleFunc("/books", app.createBook).Methods("POST")
-	router.HandleFunc("/books/{id}", app.updateBook).Methods("PUT")
-	router.HandleFunc("/books/{id}", app.deleteBook).Methods("DELETE")
+	router.HandleFunc("/books", authMW(app.getBooks)).Methods("GET")
+	router.HandleFunc("/books/{id}", authMW(app.getBook)).Methods("GET")
+	router.HandleFunc("/books", authMW(app.createBook)).Methods("POST")
+	router.HandleFunc("/books/{id}", authMW(app.updateBook)).Methods("PUT")
+	router.HandleFunc("/books/{id}", authMW(app.deleteBook)).Methods("DELETE")
 
 	// Handle Google OAuth login
 	router.HandleFunc("/auth/google/login", app.handleGoogleLogin).Methods("GET")
+	router.HandleFunc("/auth/google/logout", app.handleGoogleLogout).Methods("POST")
+	router.HandleFunc("/auth/google/callback", app.handleGoogleCallback).Methods("GET")
 
 	// Start the server
 	fmt.Println("Server listening on port 8000...")
@@ -242,10 +247,20 @@ func (a *App) deleteBook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
+	// Check if the user already has the authToken cookie
+	_, err := r.Cookie("authToken")
+	if err == nil {
+		// If authToken cookie exists, redirect the user to another page or display a message
+		w.Write([]byte("You are already logged in"))
+		return
+	}
+
 	// Redirect user to Google's consent screen
 	url := a.oauthConfig.AuthCodeURL("state")
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+}
 
+func (a *App) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	// Retrieve authorization code from the query parameters
 	code := r.URL.Query().Get("code")
 	if code == "" {
@@ -265,18 +280,9 @@ func (a *App) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v3/userinfo")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	defer resp.Body.Close()
-
-	// Read the entire response body
-	// body, err := ioutil.ReadAll(resp.Body)
-	// if err != nil {
-	// 	http.Error(w, err.Error(), http.StatusInternalServerError)
-	// 	return
-	// }
-
-	// Convert the response body to a string and print it
-	// fmt.Println("Response Body:", string(body))
 
 	// Decode User response body
 	var userInfo User
@@ -285,7 +291,7 @@ func (a *App) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if user already exist in database
+	// Check if user already exists in the database
 	var count int
 	err = a.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1", userInfo.Email).Scan(&count)
 	if err != nil {
@@ -302,6 +308,99 @@ func (a *App) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Set user token cookie
+	cookie := &http.Cookie{
+		Name:    "authToken",
+		Value:   token.AccessToken,
+		Path:    "/",
+		Expires: token.Expiry,
+	}
+	http.SetCookie(w, cookie)
+
 	// Display success message
 	w.Write([]byte("Authentication successful!"))
+}
+
+func authMW(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// get cookie
+		cookie, err := r.Cookie("authToken")
+
+		if err != nil {
+			switch {
+			case errors.Is(err, http.ErrNoCookie):
+				http.Error(w, "Unauthorized!", http.StatusBadRequest)
+			default:
+				log.Println(err)
+				http.Error(w, "server error", http.StatusInternalServerError)
+			}
+			return
+		}
+
+		// Create token source with the OAuth2 token
+		tokenSource := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: cookie.Value})
+
+		// Create OAuth2 client with the token source
+		oauthClient := oauth2.NewClient(context.Background(), tokenSource)
+
+		// Send request to Google's tokeninfo endpoint to validate the token
+		resp, err := oauthClient.Get("https://www.googleapis.com/oauth2/v3/tokeninfo")
+		if err != nil {
+			return
+		}
+
+		defer resp.Body.Close()
+
+		// Check if response status code is OK
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+func (a *App) handleGoogleLogout(w http.ResponseWriter, r *http.Request) {
+
+	// Get token from user request cookie
+	userToken, err := r.Cookie("authToken")
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Revoke token process
+	token := &oauth2.Token{AccessToken: userToken.Value}
+
+	// Create an OAuth2 client with the token source
+	oauthClient := a.oauthConfig.Client(context.Background(), token)
+
+	// Send a POST request to revoke the token
+	resp, err := oauthClient.PostForm("https://oauth2.googleapis.com/revoke", url.Values{
+		"token": {token.AccessToken},
+	})
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	// Check if the request was successful
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		fmt.Printf("failed to revoke token: %s", resp.Status)
+		return
+	} else {
+		fmt.Println("Token revoked")
+	}
+
+	// Clear the authToken cookie
+	cookie := &http.Cookie{
+		Name:    "authToken",
+		Value:   "",
+		Expires: time.Now().AddDate(0, 0, -1),
+		Path:    "/", // Ensure the cookie is deleted across all paths
+	}
+
+	http.SetCookie(w, cookie)
+	w.Write([]byte("Logout successful!"))
 }
