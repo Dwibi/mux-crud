@@ -8,8 +8,6 @@ services:
       - "8000:8000"
     environment:
       - DB_URL=host=db user=postgres password=postgres dbname=postgres sslmode=disable
-      # Add your GOOGLE_CLIENT_ID here
-      # Add your GOOGLE_CLIENT_SECRET here
 
     depends_on:
       - db
